@@ -20,6 +20,7 @@ const UA := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML
 var cookies: Dictionary = {}          # host -> { name: value }
 var logged_in: bool = false
 var last_error: String = ""
+var _auth_running: bool = false        # guards against parallel logins
 
 func debug(msg: String) -> void:
 	Store.debug("net: " + msg)
@@ -60,7 +61,20 @@ func get_week(begin: String, end: String) -> Dictionary:
 	return {"error": "", "data": data}
 
 ## Log in with explicit credentials (used by the login dialog).
+## Serialised: a second concurrent login would overwrite the first one's
+## SimpleSAML session cookie and invalidate the AuthState it is about to POST,
+## so we refuse the second one instead of clobbering the first.
 func login(login_name: String, password: String) -> bool:
+	if _auth_running:
+		last_error = "Вход уже идёт"
+		debug("login skipped: another login is already running")
+		return false
+	_auth_running = true
+	var ok: bool = await _login_impl(login_name, password)
+	_auth_running = false
+	return ok
+
+func _login_impl(login_name: String, password: String) -> bool:
 	last_error = ""
 	logged_in = false
 	debug("=== LOGIN START ===")
@@ -85,15 +99,25 @@ func login(login_name: String, password: String) -> bool:
 		debug("AuthState not found on login page (url=%s)" % login_url)
 		return false
 
+	_dump_login_form(String(r.get("body", "")))
+
 	# The SimpleSAML form posts to action="?" (same path, empty query).
 	var post_url := login_url.split("?")[0]
 	var form := "username=%s&password=%s&AuthState=%s" % [
 		_uri(login_name), _uri(password), _uri(authstate)
 	]
 	debug("POST login -> %s (AuthState len=%d)" % [post_url, authstate.length()])
-	var r2 := await _request(HTTPClient.METHOD_POST, post_url,
-		PackedStringArray(["Content-Type: application/x-www-form-urlencoded"]),
-		form.to_utf8_buffer())
+	_log_post(post_url, form)
+	var r2 := await _request(HTTPClient.METHOD_POST, post_url, PackedStringArray([
+		"Content-Type: application/x-www-form-urlencoded",
+		"Origin: https://idp.ieml.ru",
+		"Referer: " + login_url,
+		"Upgrade-Insecure-Requests: 1",
+	]), form.to_utf8_buffer())
+	if r2.get("code", -1) == -1:
+		last_error = "Сервер не ответил (ошибка сети %d)" % int(r2.get("result", -1))
+		debug("login POST failed: %s" % last_error)
+		return false
 	debug("login POST <- code=%d len=%d loc=%s" % [r2.code, String(r2.body).length(), r2.loc])
 
 	var final := await _finish_forms(r2, 14)
@@ -165,6 +189,9 @@ func _request(method: int, url: String, extra_headers: PackedStringArray, body: 
 	await get_tree().process_frame
 
 	var host := _host_of(url)
+	# TODO(temporary): distinguish "slow" from "no answer" on the IdP.
+	if host == "idp.ieml.ru":
+		http.timeout = 60.0
 	var headers := PackedStringArray([
 		"User-Agent: " + UA,
 		"Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -177,23 +204,33 @@ func _request(method: int, url: String, extra_headers: PackedStringArray, body: 
 	for h in extra_headers:
 		headers.append(h)
 
+	var t0 := Time.get_ticks_msec()
 	var err := http.request_raw(url, headers, method, body)
 	if err != OK:
 		http.queue_free()
 		debug("request error %d for %s" % [err, url])
-		return {"code": -1, "url": url, "loc": "", "body": "", "host": host}
+		return {"code": -1, "result": -1, "url": url, "loc": "", "body": "", "host": host}
 
 	var res: Array = await http.request_completed
+	var ms := Time.get_ticks_msec() - t0
 	http.queue_free()
 
+	var result := int(res[0])
+	var code := int(res[1])
 	var rh: PackedStringArray = res[2]
+	var raw: PackedByteArray = res[3]
 	_store_set_cookies(host, rh)
-	debug("%s %s -> %d" % [("POST" if method == HTTPClient.METHOD_POST else "GET"), _short(url), int(res[1])])
+	var verb := "POST" if method == HTTPClient.METHOD_POST else "GET"
+	debug("%s %s -> http=%d result=%d len=%d ms=%d" % [verb, _short(url), code, result, raw.size(), ms])
+	if result != HTTPRequest.RESULT_SUCCESS and result != HTTPRequest.RESULT_REDIRECT_LIMIT_REACHED:
+		debug("%s %s dropped before a response (result=%d ms=%d)" % [verb, _short(url), result, ms])
+		return {"code": -1, "result": result, "url": url, "loc": "", "body": "", "host": host}
 	return {
-		"code": int(res[1]),
+		"code": code,
+		"result": result,
 		"url": url,
 		"loc": _header(rh, "location"),
-		"body": (res[3] as PackedByteArray).get_string_from_utf8(),
+		"body": raw.get_string_from_utf8(),
 		"host": host,
 	}
 
@@ -234,9 +271,12 @@ func _finish_forms(from: Dictionary, max_loops: int) -> Dictionary:
 			var action: String = _abs(r.url, String(form["action"]))
 			var body := _build_form_body(form["fields"])
 			debug("submit form -> %s (%d fields)" % [_short(action), (form["fields"] as Dictionary).size()])
-			r = await _request(HTTPClient.METHOD_POST, action,
-				PackedStringArray(["Content-Type: application/x-www-form-urlencoded"]),
-				body.to_utf8_buffer())
+			r = await _request(HTTPClient.METHOD_POST, action, PackedStringArray([
+				"Content-Type: application/x-www-form-urlencoded",
+				"Origin: https://idp.ieml.ru",
+				"Referer: " + String(r.get("final_url", r.url)),
+				"Upgrade-Insecure-Requests: 1",
+			]), body.to_utf8_buffer())
 			continue
 		if r.code >= 300 and r.code < 400 and r.loc != "":
 			r = await _request(HTTPClient.METHOD_GET, _abs(r.url, r.loc), PackedStringArray(), PackedByteArray())
@@ -346,6 +386,62 @@ func _extract_form(body: String, only_field: String = "") -> Variant:
 		if fields.has("SAMLResponse"):
 			return {"action": action, "fields": fields}
 	return {} if only_field == "" else ""
+
+## Log every <input>/<button> of the form that contains the password field,
+## so we can compare it with the fields we actually POST. Password value is hidden.
+func _dump_login_form(body: String) -> void:
+	var form_re := RegEx.new()
+	if form_re.compile("(?is)(<form\\b[^>]*>)(.*?)</form>") != OK:
+		debug("login form: regex failed")
+		return
+	var found := false
+	for fm in form_re.search_all(body):
+		var open_tag: String = fm.get_string(1).strip_edges().replace("\n", " ").replace("\t", " ")
+		var inner: String = fm.get_string(2)
+		if inner.to_lower().find("password") == -1:
+			continue
+		found = true
+		debug("login form: " + open_tag)
+		var ir := RegEx.new()
+		ir.compile("(?is)<input\\b[^>]*>")
+		for im in ir.search_all(inner):
+			var tag: String = im.get_string(0)
+			var n := _attr(tag, "name")
+			var t := _attr(tag, "type")
+			var v := _attr(tag, "value")
+			if t.to_lower() == "password":
+				v = "<<hidden>>"
+			debug("  input name='%s' type='%s' value='%s'" % [n, t, v])
+		var br := RegEx.new()
+		br.compile("(?is)<button\\b[^>]*>.*?</button>")
+		for bm in br.search_all(inner):
+			var tag2: String = bm.get_string(0)
+			debug("  button name='%s' type='%s' value='%s'" % [_attr(tag2, "name"), _attr(tag2, "type"), _attr(tag2, "value")])
+	if not found:
+		debug("login form: no form containing a password input was found")
+
+## Log exactly what leaves in a POST: URL, header NAMES, cookie NAMES (no values),
+## body field NAMES (no values) and body length.
+func _log_post(url: String, body: String) -> void:
+	var host := _host_of(url)
+	var hdrs := PackedStringArray([
+		"User-Agent", "Accept", "Accept-Language", "Accept-Encoding",
+		"Origin", "Referer", "Upgrade-Insecure-Requests", "Cookie",
+	])
+	var cnames := PackedStringArray()
+	var jar: Dictionary = cookies.get(host, {})
+	for k in jar:
+		cnames.append(String(k))
+	var fnames := PackedStringArray()
+	for pair in body.split("&"):
+		if String(pair) == "":
+			continue
+		fnames.append(String(pair).split("=")[0])
+	debug("POST DETAILS url=%s" % url)
+	debug("  headers: " + ", ".join(hdrs))
+	debug("  cookie names: " + (", ".join(cnames) if cnames.size() > 0 else "(none)"))
+	debug("  body fields: " + ", ".join(fnames))
+	debug("  body len: %d" % body.to_utf8_buffer().size())
 
 func _attr(tag: String, name: String) -> String:
 	var re := RegEx.new()
